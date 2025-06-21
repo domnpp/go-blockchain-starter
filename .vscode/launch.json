@@ -11,6 +11,14 @@
             "mode": "auto",
             "program": "main.go",
             "args": ["-port", "8000"]
+        },
+        {
+            "name": "JoinNode",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "main.go",
+            "args": ["-port", "8002", "-node_url", "127.0.0.1:8001"]
         }
     ]
 }

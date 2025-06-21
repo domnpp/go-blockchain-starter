@@ -24,11 +24,18 @@ type NodeManager struct {
 	mutex sync.RWMutex
 }
 
-func (nm *NodeManager) AddPeer(node *network.Node) {
+func (nm *NodeManager) AddPeer(node *network.Node) bool {
+	// Check if peer already exists
+	if _, exists := nm.peers[node.UUID]; exists {
+		fmt.Printf("❌ Peer already exists: %s\n", node.Address)
+		return false
+	}
+
 	nm.mutex.Lock()
 	defer nm.mutex.Unlock()
 	nm.peers[node.UUID] = node
 	fmt.Printf("➕ Added peer: %s\n", node.Address)
+	return true
 }
 
 func NewNodeManager(port int) *NodeManager {
@@ -73,9 +80,6 @@ func main() {
 
 	nodeManager = NewNodeManager(my_port)
 
-	// Start HTTP server for network discovery in another thread (goroutine).
-	// go startHTTPServer(*port)
-
 	// Start TCP listener for peer connections
 	go startTCPListener(my_port)
 
@@ -92,7 +96,7 @@ func main() {
 			nodesString[i] = fmt.Sprintf("%s:%d", node.Address, node.Port)
 		}
 		fmt.Printf("🔗 Network state: [\"%s\"]\n", strings.Join(nodesString, "\", \""))
-		time.Sleep(3600 * time.Millisecond)
+		time.Sleep(600 * time.Millisecond)
 	}
 }
 
@@ -128,6 +132,8 @@ func handleIncomingConnection(conn net.Conn) {
 	// Identify?
 	msg := network.Message{
 		FunctionName: network.Identify,
+		UUID:         my_uuid,
+		Port:         my_port,
 	}
 
 	// Convert message to JSON bytes
@@ -167,32 +173,43 @@ func nodeCommunication(conn net.Conn) {
 		}
 		switch msg.FunctionName {
 		case network.Identify:
+			peer_uuid := msg.UUID
+			peer_port := msg.Port
+			uuid = peer_uuid
+			peer_address := conn.RemoteAddr().String()
+			ip, _, err := net.SplitHostPort(peer_address)
+			if err != nil {
+				fmt.Printf("❌ Failed to split host and port: %v\n", err)
+				os.Exit(1)
+			}
+			nodeManager.AddPeer(&network.Node{Address: ip, Port: peer_port, UUID: peer_uuid})
+
 			msg := network.Message{
 				FunctionName: network.Identification,
 				Port:         my_port,
 				UUID:         my_uuid,
 			}
-			jsonData, err := json.Marshal(msg)
+			myIdentification, err := json.Marshal(msg)
 			if err != nil {
 				fmt.Printf("❌ Failed to marshal message: %v\n", err)
 			}
-			fmt.Printf("➡️ Sending id.(%s) to %s\n", string(jsonData), conn.RemoteAddr().String())
-			sz_written, err := conn.Write(jsonData)
+			fmt.Printf("➡️ Sending id.(%s) to %s\n", string(myIdentification), conn.RemoteAddr().String())
+			sz_written, err := conn.Write(myIdentification)
 			// Was write successful?
-			if err != nil || sz_written != len(jsonData) {
+			if err != nil || sz_written != len(myIdentification) {
 				fmt.Printf("❌ Failed to write message: %v\n", err)
 				os.Exit(1)
 			}
 			msg = network.Message{
 				FunctionName: network.Network,
 			}
-			jsonData, err = json.Marshal(msg)
-			if err != nil {
-				fmt.Printf("❌ Failed to marshal message: %v\n", err)
+			networkMsg, err1 := json.Marshal(msg)
+			if err1 != nil {
+				fmt.Printf("❌ Failed to marshal message: %v\n", err1)
 				os.Exit(1)
 			}
 			fmt.Printf("➡️ Network %s\n", conn.RemoteAddr().String())
-			sz_written, err = conn.Write(jsonData)
+			_, _ = conn.Write(networkMsg)
 
 		case network.Identification:
 			// Add peer to our list
@@ -215,13 +232,13 @@ func nodeCommunication(conn net.Conn) {
 				FunctionName: network.NetworkResponse,
 				Peers:        peers_list,
 			}
-			jsonData, err := json.Marshal(msg)
-			if err != nil {
-				fmt.Printf("❌ Failed to marshal message: %v\n", err)
+			networkResponse, err1 := json.Marshal(msg)
+			if err1 != nil {
+				fmt.Printf("❌ Failed to marshal message: %v\n", err1)
 			}
 			fmt.Printf("➡️ NetworkResponse %s\n", conn.RemoteAddr().String())
-			sz_written, err := conn.Write(jsonData)
-			if err != nil || sz_written != len(jsonData) {
+			sz_written, err := conn.Write(networkResponse)
+			if err != nil || sz_written != len(networkResponse) {
 				fmt.Printf("❌ Failed to write message: %v\n", err)
 				os.Exit(1)
 			}
@@ -229,7 +246,10 @@ func nodeCommunication(conn net.Conn) {
 			// Add peers to our list
 			fmt.Printf("⬅️ NetworkResponse %s\n", conn.RemoteAddr().String())
 			for _, peer := range msg.Peers {
-				nodeManager.AddPeer(&peer)
+				added := nodeManager.AddPeer(&peer)
+				if added {
+					connectToNode(fmt.Sprintf("%s:%d", peer.Address, peer.Port))
+				}
 			}
 		}
 	}
