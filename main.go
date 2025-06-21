@@ -7,9 +7,9 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
+	app_bc "gochain/blockchain"
 	"gochain/network"
 
 	"github.com/google/uuid"
@@ -18,54 +18,26 @@ import (
 // Identification of ourself - UUID.
 var my_uuid string
 
-// NodeManager handles peer connections and network discovery
-type NodeManager struct {
-	peers map[string]*network.Node
-	mutex sync.RWMutex
-}
-
-func (nm *NodeManager) AddPeer(node *network.Node) bool {
-	// Check if peer already exists
-	if _, exists := nm.peers[node.UUID]; exists {
-		fmt.Printf("❌ Peer already exists: %s\n", node.Address)
-		return false
+func NewNodeManager(port int) *network.NodeManager {
+	nm := &network.NodeManager{
+		Peers: make(map[string]*network.Node),
 	}
-
-	nm.mutex.Lock()
-	defer nm.mutex.Unlock()
-	nm.peers[node.UUID] = node
-	fmt.Printf("➕ Added peer: %s\n", node.Address)
-	return true
-}
-
-func NewNodeManager(port int) *NodeManager {
-	nm := &NodeManager{
-		peers: make(map[string]*network.Node),
-	}
-	nm.AddPeer(&network.Node{Address: "127.0.0.1", Port: port, UUID: my_uuid})
+	nm.AddPeer("127.0.0.1", port, my_uuid, nil)
 	return nm
 }
 
-func (nm *NodeManager) RemovePeer(uuid string) {
-	nm.mutex.Lock()
-	defer nm.mutex.Unlock()
-
-	delete(nm.peers, uuid)
-}
-
-func (nm *NodeManager) GetPeers() []*network.Node {
-	nm.mutex.RLock()
-	defer nm.mutex.RUnlock()
-
-	peers := make([]*network.Node, 0, len(nm.peers))
-	for _, peer := range nm.peers {
-		peers = append(peers, peer)
-	}
-	return peers
-}
-
-var nodeManager *NodeManager
+var nodeManager *network.NodeManager
 var my_port int
+var blockchain *app_bc.BlockchainController
+
+func callAddPeer(nodeManager *network.NodeManager, address string, port int, uuid string, conn *net.Conn) (*network.Node, bool) {
+	r, added := nodeManager.AddPeer(address, port, uuid, conn)
+	if added && !blockchain.Enabled && len(nodeManager.Peers) > 1 {
+		blockchain.Enabled = true
+		go app_bc.MainLoop(blockchain, nodeManager, my_uuid)
+	}
+	return r, added
+}
 
 func main() {
 	port_flag := flag.Int("port", 8000, "Port to listen on")
@@ -79,6 +51,10 @@ func main() {
 	fmt.Printf("🚀 Starting node: %d\n", my_port)
 
 	nodeManager = NewNodeManager(my_port)
+	blockchain = &app_bc.BlockchainController{
+		Enabled: false,
+		State:   app_bc.AppState_Entering,
+	}
 
 	// Start TCP listener for peer connections
 	go startTCPListener(my_port)
@@ -86,6 +62,8 @@ func main() {
 	if *nodeURL != "" {
 		fmt.Printf("🔗 Connecting to: %s\n", *nodeURL)
 		connectToNode(*nodeURL)
+	} else {
+		blockchain.State = app_bc.AppState_Selecting
 	}
 
 	for {
@@ -130,7 +108,7 @@ func handleIncomingConnection(conn net.Conn) {
 	fmt.Printf("🔗 New connection from: %s\n", remoteAddr)
 
 	// Identify?
-	msg := network.Message{
+	msg := network.Setup{
 		FunctionName: network.Identify,
 		UUID:         my_uuid,
 		Port:         my_port,
@@ -165,7 +143,7 @@ func nodeCommunication(conn net.Conn) {
 		}
 
 		// Convert message to our struct. JSON deserialize.
-		var msg network.Message
+		var msg network.Setup
 		err = json.Unmarshal(buffer[:n], &msg)
 		if err != nil {
 			fmt.Printf("❌ Failed to unmarshal message: %v\n", err)
@@ -182,9 +160,10 @@ func nodeCommunication(conn net.Conn) {
 				fmt.Printf("❌ Failed to split host and port: %v\n", err)
 				os.Exit(1)
 			}
-			nodeManager.AddPeer(&network.Node{Address: ip, Port: peer_port, UUID: peer_uuid})
+			// Existing node is asking us to identify. Add it to the list.
+			callAddPeer(nodeManager, ip, peer_port, peer_uuid, &conn)
 
-			msg := network.Message{
+			msg := network.Setup{
 				FunctionName: network.Identification,
 				Port:         my_port,
 				UUID:         my_uuid,
@@ -200,7 +179,7 @@ func nodeCommunication(conn net.Conn) {
 				fmt.Printf("❌ Failed to write message: %v\n", err)
 				os.Exit(1)
 			}
-			msg = network.Message{
+			msg = network.Setup{
 				FunctionName: network.Network,
 			}
 			networkMsg, err1 := json.Marshal(msg)
@@ -218,7 +197,8 @@ func nodeCommunication(conn net.Conn) {
 				fmt.Printf("❌ Failed to split host and port: %v\n", err)
 				return
 			}
-			nodeManager.AddPeer(&network.Node{Address: ip, Port: msg.Port, UUID: msg.UUID})
+			// Someone connected to us. Add them to our list.
+			callAddPeer(nodeManager, ip, msg.Port, msg.UUID, &conn)
 			uuid = msg.UUID
 
 		case network.Network:
@@ -228,7 +208,7 @@ func nodeCommunication(conn net.Conn) {
 			for i, peer := range peers {
 				peers_list[i] = *peer
 			}
-			msg := network.Message{
+			msg := network.Setup{
 				FunctionName: network.NetworkResponse,
 				Peers:        peers_list,
 			}
@@ -246,8 +226,9 @@ func nodeCommunication(conn net.Conn) {
 			// Add peers to our list
 			fmt.Printf("⬅️ NetworkResponse %s\n", conn.RemoteAddr().String())
 			for _, peer := range msg.Peers {
-				added := nodeManager.AddPeer(&peer)
+				n, added := callAddPeer(nodeManager, peer.Address, peer.Port, peer.UUID, nil)
 				if added {
+					n.Conn = &conn
 					connectToNode(fmt.Sprintf("%s:%d", peer.Address, peer.Port))
 				}
 			}
